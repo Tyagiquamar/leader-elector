@@ -12,27 +12,30 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `k8s.io/client-go` (`leaderelection`, `resourcelock.LeaseLock`) for the election itself — always uses `rest.InClusterConfig()`, so it only runs inside a cluster
 - `github.com/alexflint/go-arg` for CLI flag / env var parsing
 - `k8s.io/klog/v2` for logging
-- No test files, no Makefile, no linter config, no CI test job — the only CI workflow builds and publishes the Docker image
+- No test files, no Makefile, no linter config — the only CI workflow builds and publishes the Docker image
 
 ## Architecture
 
 The whole program is two files:
 
-- `main.go` — parses CLI args/env vars into a package-level `args` struct, starts a minimal HTTP server (`net/http`, no framework) that serves the current leader as JSON (`{"name": "..."}`) on `/`, wires up an `os.Interrupt`/`SIGTERM` handler that cancels a `context.Context` to trigger graceful leader step-down, then calls `Run` (blocking) and shuts the HTTP server down afterward.
-- `election.go` — `Run(ctx, cfg Config)` builds an in-cluster Kubernetes client, constructs a `resourcelock.LeaseLock` scoped to `cfg.LockName`/`cfg.LockNamespace` with `Identity` set to `$HOSTNAME` (the Pod name), and calls `leaderelection.RunOrDie` with that lock. `cfg.Callback` (set to a closure in `main.go` that updates the package-level `leader` var) fires on `OnStartedLeading` and `OnNewLeader`, so the HTTP handler always reflects the most recently observed leader, not just "am I the leader."
+- `main.go` — parses CLI args/env vars into a package-level `args` struct, starts a minimal HTTP server (`net/http`, no framework) that serves the current leader as JSON (`{"name": "..."}`) on `/` and accepts `POST /done` (closes the `taskDone` channel once, via `sync.Once`), builds the lease names from `--election`/`--revision`, wires up an `os.Interrupt`/`SIGTERM` handler that cancels a `context.Context` to trigger graceful leader step-down, then calls `Run` (blocking) and shuts the HTTP server down afterward.
+- `election.go` — `Run(ctx, cfg Config)` builds an in-cluster Kubernetes client, constructs a `resourcelock.LeaseLock` scoped to `cfg.LockName`/`cfg.LockNamespace` with `Identity` set to `$HOSTNAME` (the Pod name), and calls `leaderelection.RunOrDie` with that lock. `cfg.Callback` (set to a closure in `main.go` that updates the package-level `leader` var) fires on `OnNewLeader` for other pods, so the HTTP handler reflects the most recently observed leader. For its own identity, `OnStartedLeading` calls `runExclusive`:
+  - **Simple mode** (`cfg.RunningLockName == ""`, no `--revision`): reports itself as leader immediately.
+  - **Revision mode** (`--revision` set, lock is `<election>-<revision>`): runs a nested `RunOrDie` on the shared `<election>-running` lease and only reports itself once it holds it, which serializes leaders across rollouts. `cfg.Done` (from `POST /done`) cancels the nested election, releasing the lease via `ReleaseOnCancel`; if `/done` already fired, it skips the running lease. Until it holds the lease, the leader's own `/` returns `""`, so callers must poll.
 
 Configuration is entirely via CLI flags or environment variables (`go-arg` struct tags in `main.go`):
 
 | Flag | Env var | Default | Purpose |
 |---|---|---|---|
 | `--election` | `ELECTION_NAME` | `default` | Name of the Lease object |
-| (positional `Namespace`) | `ELECTION_NAMESPACE` | `default` | Namespace of the Lease |
+| `--namespace` | `ELECTION_NAMESPACE` | `default` | Namespace of the Lease(s) |
+| `--revision` | `ELECTION_REVISION` | (unset) | Enables revision mode; typically the `pod-template-hash` label. `running` is rejected |
 | `--renew-deadline` | `ELECTION_RENEW_DEADLINE` | `10s` | How long the leader retries renewing before giving up |
 | `--retry-period` | `ELECTION_RETRY_PERIOD` | `2s` | Delay between election retries |
 | `--lease-duration` | `ELECTION_LEASE_DURATION` | `15s` | How long non-leaders wait before attempting to acquire an unrenewed lease |
 | `--port` | `ELECTION_PORT` | `4040` | Port for the leader-query HTTP endpoint |
 
-The `example/` directory shows the intended deployment pattern: `leader-elector` runs as an `initContainer` sidecar in a Deployment, and a `ServiceAccount`/`Role`/`RoleBinding` (`example/rbac.yaml`) grant it `get`/`create`/`update` on `leases.coordination.k8s.io` in its namespace. Other containers in the same Pod query `http://localhost:<port>` to learn who currently holds leadership.
+The `example/` directory shows the intended deployment pattern: `leader-elector` runs as a native sidecar (`initContainer` with `restartPolicy: Always`) in a Deployment — `deployment.yaml` for simple mode, `deployment-revision.yaml` for revision mode with a poll-then-`POST /done` task container — and a `ServiceAccount`/`Role`/`RoleBinding` (`example/rbac.yaml`) grant it `get`/`create`/`update` on `leases.coordination.k8s.io` in its namespace. Other containers in the same Pod query `http://localhost:<port>` to learn who currently holds leadership.
 
 ## Common Commands
 
@@ -52,4 +55,10 @@ go mod tidy
 docker build -t leader-elector .
 ```
 
-There are no test files, linter configuration, or Makefile in this repo. The only GitHub Actions workflow (`.github/workflows/publish.yml`) builds and pushes a multi-arch (`linux/amd64,linux/arm64`) Docker image to Docker Hub (`localopsroot/leader-elector`) when a `v*.*.*` tag is pushed — it does not run tests.
+There are no test files, linter configuration, or Makefile in this repo. Three GitHub Actions workflows build a multi-arch (`linux/amd64,linux/arm64`) Docker image:
+
+- `build-leader-elector.yml`: on every PR, build only
+- `push-leader-elector-ecr.yml`: on a push to `main`, push to our public ECR (`public.ecr.aws/...`) tagged with the short commit SHA, for testing unreleased versions. Uses the `main` GitHub environment (`AWS_ROLE_ARN`, `AWS_REGION`, `ECR_REPOSITORY`).
+- `release-leader-elector.yml`: on a `v*.*.*` tag pointing at a commit on `prod`, push to Docker Hub (`localopsroot/leader-elector`) as `1.2.3` (the `v` is stripped) and `latest`. Uses the `prod` GitHub environment (`DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN`). A tag on a commit that isn't on `prod` fails and publishes nothing.
+
+To release, merge `main` into `prod` via PR, then tag the prod commit (`git switch prod && git pull && git tag vX.Y.Z && git push origin vX.Y.Z`). Docker Hub already has `1.1.0` without a matching git tag, so the next release must be `v1.1.1` or later.
